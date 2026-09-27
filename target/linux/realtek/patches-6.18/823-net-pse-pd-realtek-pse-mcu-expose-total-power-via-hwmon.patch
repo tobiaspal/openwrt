@@ -1,0 +1,222 @@
+From 62805213b6ca189279d43238a83ed683d1b75236 Mon Sep 17 00:00:00 2001
+From: Paul Tobias <kernel-commits@tobias.pt>
+Date: Mon, 28 Sep 2026 10:23:17 +0700
+Subject: [PATCH] net: pse-pd: realtek-pse-mcu: expose total power and budget
+ via hwmon
+
+The MCU meters the whole PSE: what all ports draw together and the
+budget it sheds load against (the board's supply minus its guard band).
+Neither is a per-port value, so ethtool's PSE interface has no place for
+them, and the realtek-poe user-space daemon this driver replaces used to
+report both.
+
+Read the Gen1 "get power stats" frame (0x23; 0x41 on Gen2, taken from
+realtek-poe and untested here) on demand and publish it as one hwmon
+power channel: power1_input is the consumption, power1_cap the budget,
+both in microwatts from the MCU's 100 mW units, label "PoE".
+
+Tested on a Netgear GS310TP (Gen1 over I2C, BCM59121) with two powered
+ports: six samples two seconds apart read 12.9 to 13.4 W from
+power1_input against 11.1 to 13.8 W summed from the per-port ethtool
+figures, both instantaneous MCU readings; power1_cap reads 48 W, the
+55 W supply minus the 7 W guard band.
+
+Assisted-by: LLM sparse
+Signed-off-by: Paul Tobias <kernel-commits@tobias.pt>
+---
+--- a/drivers/net/pse-pd/Kconfig
++++ b/drivers/net/pse-pd/Kconfig
+@@ -22,6 +22,7 @@ config PSE_REALTEK_MCU
+ config PSE_REALTEK_MCU_I2C
+ 	tristate "Realtek PSE MCU driver (I2C transport)"
+ 	depends on I2C
++	depends on HWMON || HWMON=n
+ 	select PSE_REALTEK_MCU
+ 	help
+ 	  Driver for the microcontroller (MCU) that fronts the PSE
+@@ -33,6 +34,7 @@ config PSE_REALTEK_MCU_I2C
+ config PSE_REALTEK_MCU_UART
+ 	tristate "Realtek PSE MCU driver (UART transport)"
+ 	depends on SERIAL_DEV_BUS
++	depends on HWMON || HWMON=n
+ 	select PSE_REALTEK_MCU
+ 	help
+ 	  Driver for the microcontroller (MCU) that fronts the PSE
+--- a/drivers/net/pse-pd/realtek-pse-mcu-core.c
++++ b/drivers/net/pse-pd/realtek-pse-mcu-core.c
+@@ -33,6 +33,7 @@
+ #include <linux/container_of.h>
+ #include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
++#include <linux/hwmon.h>
+ #include <linux/jiffies.h>
+ #include <linux/kstrtox.h>
+ #include <linux/minmax.h>
+@@ -77,6 +78,7 @@ enum rtpse_mcu_cmd {
+ 	RTPSE_MCU_CMD_SET_GLOBAL_STATE,
+ 	RTPSE_MCU_CMD_GET_SYSTEM_INFO,
+ 	RTPSE_MCU_CMD_GET_EXT_CONFIG,
++	RTPSE_MCU_CMD_GET_POWER_STATS,
+ 	RTPSE_MCU_CMD_SET_POWER_MANAGEMENT_MODE,
+ 
+ 	RTPSE_MCU_CMD_PORT_ENABLE,
+@@ -114,6 +116,11 @@ struct rtpse_mcu_ext_config {
+ 	u8 num_of_pses;
+ };
+ 
++struct rtpse_mcu_power_stats {
++	u16 consumption_raw;	/* 100mW/LSB, all ports together */
++	u16 budget_raw;		/* 100mW/LSB, the MCU's own limit after its guard band */
++};
++
+ struct rtpse_mcu_port_status {
+ 	u8 sts1;
+ 	u8 sts2;
+@@ -366,6 +373,28 @@ static int rtpse_mcu_get_ext_config(stru
+ 	return 0;
+ }
+ 
++static int rtpse_mcu_get_power_stats(struct rtpse_mcu_ctrl *pse,
++				     struct rtpse_mcu_power_stats *stats)
++{
++	struct rtpse_mcu_msg req, resp;
++	const struct rtpse_mcu_opcode *opc;
++	int ret;
++
++	opc = &pse->dialect->opcode[RTPSE_MCU_CMD_GET_POWER_STATS];
++	if (!opc->valid)
++		return -EOPNOTSUPP;
++
++	rtpse_mcu_msg_init(&req, opc->op);
++	ret = rtpse_mcu_do_xfer(pse, &req, &resp);
++	if (ret)
++		return ret;
++
++	stats->consumption_raw = get_unaligned_be16(&resp.payload[0]);
++	stats->budget_raw = get_unaligned_be16(&resp.payload[2]);
++
++	return 0;
++}
++
+ static int rtpse_mcu_set_global_state(struct rtpse_mcu_ctrl *pse, bool enable)
+ {
+ 	struct rtpse_mcu_msg req, resp;
+@@ -888,6 +917,89 @@ static int rtpse_mcu_sysfs_init(struct r
+ 	return 0;
+ }
+ 
++#if IS_REACHABLE(CONFIG_HWMON)
++/*
++ * The MCU meters the whole PSE: what all ports draw together and the budget
++ * it sheds load against (the board's supply minus the guard band it was
++ * configured with). Neither is a per-port value, so they are not part of
++ * the ethtool PSE interface; expose them as one hwmon power channel.
++ */
++static umode_t rtpse_mcu_hwmon_is_visible(const void *data,
++					  enum hwmon_sensor_types type,
++					  u32 attr, int channel)
++{
++	return 0444;
++}
++
++static int rtpse_mcu_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
++				u32 attr, int channel, long *val)
++{
++	struct rtpse_mcu_ctrl *pse = dev_get_drvdata(dev);
++	struct rtpse_mcu_power_stats stats;
++	int ret;
++
++	ret = rtpse_mcu_get_power_stats(pse, &stats);
++	if (ret)
++		return ret;
++
++	switch (attr) {
++	case hwmon_power_input:
++		*val = stats.consumption_raw * 100000L;
++		return 0;
++	case hwmon_power_cap:
++		*val = stats.budget_raw * 100000L;
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static int rtpse_mcu_hwmon_read_string(struct device *dev,
++				       enum hwmon_sensor_types type,
++				       u32 attr, int channel, const char **str)
++{
++	if (type != hwmon_power || attr != hwmon_power_label)
++		return -EOPNOTSUPP;
++
++	*str = "PoE";
++	return 0;
++}
++
++static const struct hwmon_channel_info * const rtpse_mcu_hwmon_info[] = {
++	HWMON_CHANNEL_INFO(power, HWMON_P_INPUT | HWMON_P_CAP | HWMON_P_LABEL),
++	NULL
++};
++
++static const struct hwmon_ops rtpse_mcu_hwmon_ops = {
++	.is_visible = rtpse_mcu_hwmon_is_visible,
++	.read = rtpse_mcu_hwmon_read,
++	.read_string = rtpse_mcu_hwmon_read_string,
++};
++
++static const struct hwmon_chip_info rtpse_mcu_hwmon_chip_info = {
++	.ops = &rtpse_mcu_hwmon_ops,
++	.info = rtpse_mcu_hwmon_info,
++};
++
++static int rtpse_mcu_hwmon_init(struct rtpse_mcu_ctrl *pse)
++{
++	struct device *hwmon;
++
++	if (!pse->dialect->opcode[RTPSE_MCU_CMD_GET_POWER_STATS].valid)
++		return 0;
++
++	hwmon = devm_hwmon_device_register_with_info(pse->dev, "realtek_pse_mcu",
++						     pse, &rtpse_mcu_hwmon_chip_info,
++						     NULL);
++	return PTR_ERR_OR_ZERO(hwmon);
++}
++#else
++static int rtpse_mcu_hwmon_init(struct rtpse_mcu_ctrl *pse)
++{
++	return 0;
++}
++#endif
++
+ static int rtpse_mcu_discover(struct rtpse_mcu_ctrl *pse, struct rtpse_mcu_info *info)
+ {
+ 	struct rtpse_mcu_ext_config ext_config;
+@@ -1049,7 +1161,11 @@ int rtpse_mcu_register(struct rtpse_mcu_
+ 	if (ret)
+ 		return ret;
+ 
+-	return rtpse_mcu_sysfs_init(pse);
++	ret = rtpse_mcu_sysfs_init(pse);
++	if (ret)
++		return ret;
++
++	return rtpse_mcu_hwmon_init(pse);
+ }
+ EXPORT_SYMBOL_GPL(rtpse_mcu_register);
+ 
+@@ -1125,6 +1241,7 @@ static const struct rtpse_mcu_dialect rt
+ 		[RTPSE_MCU_CMD_SET_GLOBAL_STATE]	= RTPSE_MCU_OP(0x00),
+ 		[RTPSE_MCU_CMD_GET_SYSTEM_INFO]		= RTPSE_MCU_OP(0x40),
+ 		[RTPSE_MCU_CMD_GET_EXT_CONFIG]		= RTPSE_MCU_OP(0x4a),
++		[RTPSE_MCU_CMD_GET_POWER_STATS]		= RTPSE_MCU_OP(0x41),
+ 		[RTPSE_MCU_CMD_SET_POWER_MANAGEMENT_MODE] = RTPSE_MCU_OP(0x10),
+ 
+ 		[RTPSE_MCU_CMD_PORT_ENABLE]		= RTPSE_MCU_OP(0x01),
+@@ -1149,6 +1266,7 @@ static const struct rtpse_mcu_dialect rt
+ 	.opcode = {
+ 		[RTPSE_MCU_CMD_GET_SYSTEM_INFO]		= RTPSE_MCU_OP(0x20),
+ 		[RTPSE_MCU_CMD_GET_EXT_CONFIG]		= RTPSE_MCU_OP(0x2b),
++		[RTPSE_MCU_CMD_GET_POWER_STATS]		= RTPSE_MCU_OP(0x23),
+ 		[RTPSE_MCU_CMD_SET_POWER_MANAGEMENT_MODE] = RTPSE_MCU_OP(0x17),
+ 
+ 		[RTPSE_MCU_CMD_PORT_ENABLE]		= RTPSE_MCU_OP(0x00),
